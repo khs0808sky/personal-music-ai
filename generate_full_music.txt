@@ -1,0 +1,87 @@
+def generate_full_music(user_story):
+        """
+        Full pipeline: analyze emotion, generate brief, and create actual music
+        Uses cached results if available for the same story
+        
+        Args:
+            user_story (str): User's emotional story/text
+        
+        Returns:
+            tuple: (emotion_analysis, music_brief, audio_file, status_message)
+        """
+        try:
+            if app_state.user_story != user_story:
+                app_state.clear()
+                app_state.user_story = user_story
+            
+            # Prepare the state
+            state = {
+                "user_text": user_story,
+                "force_generate": True  # Force music generation
+            }
+            
+            if app_state.has_emotion_analysis(user_story):
+                state["emotion"] = app_state.emotion_result
+                status_msg = "📋 이전 감정 분석 결과 재사용"
+            
+            if app_state.has_music_brief(user_story):
+                state["brief"] = app_state.music_brief
+                status_msg = "📋 이전 분석 결과 재사용하여 음악 생성"
+            
+            # Run the workflow (will skip already completed steps)
+            final_state = graph.invoke(state)
+            
+            # Extract results
+            emotion = final_state.get("emotion")
+            brief = final_state.get("brief")
+            audio_path = final_state.get("audio_path")
+            provider_used = final_state.get("provider_used", "skipped")
+            
+            emotion_text = f"""**🎭 주요 감정**: {emotion.primary}
+
+**📊 감정 강도 (Valence)**: {emotion.valence:.2f}
+*(-1: 매우 부정적 ↔ +1: 매우 긍정적)*
+
+**⚡ 각성도 (Arousal)**: {emotion.arousal:.2f}
+*(0: 차분함 ↔ 1: 흥분됨)*
+
+**🎯 신뢰도**: {emotion.confidence:.2f}
+
+**💭 분석 근거**: 
+{emotion.reasons}"""
+            
+            brief_text = f"""**🎵 음악 분위기**: {brief.mood}
+
+**🥁 BPM**: {brief.bpm}
+
+**🎼 조성**: {brief.key}
+
+**⏱️ 길이**: {brief.duration_sec}초
+
+**🎹 악기**: {', '.join(brief.instruments)}
+
+**🏷️ 스타일 태그**: {', '.join(brief.style_tags)}
+
+**📝 생성 프롬프트**: 
+{brief.prompt}"""
+            
+            # Status message
+            if provider_used == "skipped":
+                status = "⚠️ 음악 생성이 건너뛰어졌습니다. API 키를 확인해주세요."
+                audio_file = None
+            elif provider_used in ["replicate", "rest"]:
+                base_status = f"🎵 음악 생성 완료! ({provider_used} 사용)"
+                if 'status_msg' in locals():
+                    status = f"{status_msg} → {base_status}"
+                else:
+                    status = base_status
+                audio_file = audio_path if audio_path and os.path.exists(audio_path) else None
+            else:
+                status = "❌ 음악 생성 중 오류 발생"
+                audio_file = None
+            
+            return emotion_text, brief_text, audio_file, status
+            
+        except Exception as e:
+            error_msg = f"❌ 처리 중 오류 발생: {str(e)}"
+            return "오류 발생", "오류 발생", None, error_msg

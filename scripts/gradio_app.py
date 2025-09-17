@@ -12,24 +12,29 @@ from music_generator_core import (
     analyze_emotion_node, compose_brief_node  # Import new nodes
 )
 
+# === 상단에 유틸 추가 ===
+def _norm(s: str) -> str:
+    return " ".join((s or "").split()).strip()
+
 class AppState:
     def __init__(self):
         self.emotion_result = None
         self.music_brief = None
         self.user_story = None
-    
+
     def clear(self):
         self.emotion_result = None
         self.music_brief = None
         self.user_story = None
-    
+
+    def set_story(self, s: str):
+        self.user_story = _norm(s)
+
     def has_emotion_analysis(self, current_story):
-        return (self.emotion_result is not None and 
-                self.user_story == current_story)
-    
+        return (self.emotion_result is not None and self.user_story == _norm(current_story))
+
     def has_music_brief(self, current_story):
-        return (self.music_brief is not None and 
-                self.user_story == current_story)
+        return (self.music_brief is not None and self.user_story == _norm(current_story))
 
 # Global app state instance
 app_state = AppState()
@@ -48,9 +53,13 @@ def create_gradio_interface():
             tuple: (emotion_analysis, status_message)
         """
         try:
-            if app_state.user_story != user_story:
+            if not _norm(user_story):
+                return "스토리를 입력해 주세요.", "", None, "⚠️ 입력이 비어 있습니다."
+
+            if app_state.user_story != _norm(user_story):
                 app_state.clear()
-                app_state.user_story = user_story
+                app_state.set_story(user_story)
+
             
             # Prepare the state for emotion analysis only
             state = {
@@ -97,9 +106,13 @@ def create_gradio_interface():
             tuple: (emotion_analysis, music_brief, status_message)
         """
         try:
-            if app_state.user_story != user_story:
+            if not _norm(user_story):
+                return "스토리를 입력해 주세요.", "", None, "⚠️ 입력이 비어 있습니다."
+            
+            if app_state.user_story != _norm(user_story):
                 app_state.clear()
-                app_state.user_story = user_story
+                app_state.set_story(user_story)
+
             
             # Prepare the state
             state = {
@@ -159,56 +172,105 @@ def create_gradio_interface():
     
     def generate_full_music(user_story):
         """
-        Full pipeline: analyze emotion, generate brief, and create actual music
-        Uses cached results if available for the same story
-        
-        Args:
-            user_story (str): User's emotional story/text
-        
-        Returns:
-            tuple: (emotion_analysis, music_brief, audio_file, status_message)
+        두 모드 지원:
+        1) 원샷(분석 X) → graph.invoke 사용
+        2) 분석/브리프 끝난 후 음악만 → 캐시 재사용, 노드 직접 호출(필요시 브리프만 생성), 마지막에만 합성
         """
         try:
-            if app_state.user_story != user_story:
-                app_state.clear()
-                app_state.user_story = user_story
-            
-            # Prepare the state
-            state = {
-                "user_text": user_story,
-                "force_generate": True  # Force music generation
-            }
-            
-            if app_state.has_emotion_analysis(user_story):
-                state["emotion"] = app_state.emotion_result
-                status_msg = "📋 이전 감정 분석 결과 재사용"
-            
-            if app_state.has_music_brief(user_story):
-                state["brief"] = app_state.music_brief
-                status_msg = "📋 이전 분석 결과 재사용하여 음악 생성"
-            
-            # Run the workflow (will skip already completed steps)
-            final_state = graph.invoke(state)
-            
-            # Extract results
-            emotion = final_state.get("emotion")
-            brief = final_state.get("brief")
-            audio_path = final_state.get("audio_path")
-            provider_used = final_state.get("provider_used", "skipped")
-            
-            emotion_text = f"""**🎭 주요 감정**: {emotion.primary}
+            if not _norm(user_story):
+                return "스토리를 입력해 주세요.", "", None, "⚠️ 입력이 비어 있습니다."
 
-**📊 감정 강도 (Valence)**: {emotion.valence:.2f}
+            # 스토리 바뀌면 캐시 초기화
+            if app_state.user_story != _norm(user_story):
+                app_state.clear()
+                app_state.set_story(user_story)
+
+
+            # 환경 체크
+            openai_ok = bool(os.getenv("OPENAI_API_KEY"))
+            repl_ok   = bool(os.getenv("REPLICATE_API_TOKEN"))
+            use_repl  = os.getenv("USE_REPLICATE", "0") == "1"
+            if not openai_ok:
+                return "OpenAI 키가 없습니다.", "", None, "❌ OPENAI_API_KEY 필요"
+            if not (repl_ok and use_repl):
+                # 음악 합성은 건너뛰고, 분석/브리프만 보여주기
+                # 필요 시 여기서 분석/브리프 생성할 수도 있음
+                if not app_state.has_emotion_analysis(user_story):
+                    st = {"user_text": user_story}
+                    st = analyze_emotion_node(st)
+                    app_state.emotion_result = st["emotion"]
+                if not app_state.has_music_brief(user_story):
+                    st = {"user_text": user_story, "emotion": app_state.emotion_result}
+                    st = compose_brief_node(st)
+                    app_state.music_brief = st["brief"]
+                emo, brief = app_state.emotion_result, app_state.music_brief
+                emotion_text = f"""**🎭 주요 감정**: {emo.primary}
+
+**📊 감정 강도 (Valence)**: {emo.valence:.2f}
 *(-1: 매우 부정적 ↔ +1: 매우 긍정적)*
 
-**⚡ 각성도 (Arousal)**: {emotion.arousal:.2f}
+**⚡ 각성도 (Arousal)**: {emo.arousal:.2f}
 *(0: 차분함 ↔ 1: 흥분됨)*
 
-**🎯 신뢰도**: {emotion.confidence:.2f}
+**🎯 신뢰도**: {emo.confidence:.2f}
 
 **💭 분석 근거**: 
-{emotion.reasons}"""
-            
+{emo.reasons}"""
+                brief_text = f"""**🎵 음악 분위기**: {brief.mood}
+
+**🥁 BPM**: {brief.bpm}
+
+**🎼 조성**: {brief.key}
+
+**⏱️ 길이**: {brief.duration_sec}초
+
+**🎹 악기**: {', '.join(brief.instruments)}
+
+**🏷️ 스타일 태그**: {', '.join(brief.style_tags)}
+
+**📝 생성 프롬프트**: 
+{brief.prompt}"""
+                return emotion_text, brief_text, None, "⚠️ USE_REPLICATE=1 또는 REPLICATE 토큰 없음 → 음악 생성 건너뜀"
+
+            # ── 분기 ───────────────────────────────────────────────────────────
+            if app_state.has_emotion_analysis(user_story) and app_state.has_music_brief(user_story):
+                # ▶ 이미 분석/브리프가 있음 → 그대로 재사용해서 합성만
+                brief = app_state.music_brief
+                audio_path = generate_with_replicate_strict(brief.prompt, int(brief.duration_sec))
+                status = "🎵 기존 분석/브리프 재사용하여 음악 생성"
+            elif app_state.has_emotion_analysis(user_story) and not app_state.has_music_brief(user_story):
+                # ▶ 감정만 있음 → 브리프만 생성 후 합성
+                st = {"user_text": user_story, "emotion": app_state.emotion_result}
+                st = compose_brief_node(st)
+                app_state.music_brief = st["brief"]
+                brief = app_state.music_brief
+                audio_path = generate_with_replicate_strict(brief.prompt, int(brief.duration_sec))
+                status = "🧩 기존 감정 분석 재사용 → 브리프 생성 → 음악 생성"
+            else:
+                # ▶ 원샷 생성(분석 없이 바로) → LangGraph 전체 파이프라인 실행
+                state = {"user_text": user_story, "force_generate": True}
+                final = graph.invoke(state)  # analyze → brief → generate
+                emo = final["emotion"]; brief = final["brief"]
+                app_state.emotion_result = emo
+                app_state.music_brief = brief
+                audio_path = final.get("audio_path")
+                status = f"🚀 원샷 생성 (graph.invoke 사용; provider={final.get('provider_used','?')})"
+
+            # 출력 메시지 구성 (캐시 기준)
+            emo = app_state.emotion_result
+            brief = app_state.music_brief
+            emotion_text = f"""**🎭 주요 감정**: {emo.primary}
+
+**📊 감정 강도 (Valence)**: {emo.valence:.2f}
+*(-1: 매우 부정적 ↔ +1: 매우 긍정적)*
+
+**⚡ 각성도 (Arousal)**: {emo.arousal:.2f}
+*(0: 차분함 ↔ 1: 흥분됨)*
+
+**🎯 신뢰도**: {emo.confidence:.2f}
+
+**💭 분석 근거**: 
+{emo.reasons}"""
             brief_text = f"""**🎵 음악 분위기**: {brief.mood}
 
 **🥁 BPM**: {brief.bpm}
@@ -223,27 +285,13 @@ def create_gradio_interface():
 
 **📝 생성 프롬프트**: 
 {brief.prompt}"""
-            
-            # Status message
-            if provider_used == "skipped":
-                status = "⚠️ 음악 생성이 건너뛰어졌습니다. API 키를 확인해주세요."
-                audio_file = None
-            elif provider_used in ["replicate", "rest"]:
-                base_status = f"🎵 음악 생성 완료! ({provider_used} 사용)"
-                if 'status_msg' in locals():
-                    status = f"{status_msg} → {base_status}"
-                else:
-                    status = base_status
-                audio_file = audio_path if audio_path and os.path.exists(audio_path) else None
-            else:
-                status = "❌ 음악 생성 중 오류 발생"
-                audio_file = None
-            
-            return emotion_text, brief_text, audio_file, status
-            
+
+            return emotion_text, brief_text, audio_path, status
+
         except Exception as e:
-            error_msg = f"❌ 처리 중 오류 발생: {str(e)}"
-            return "오류 발생", "오류 발생", None, error_msg
+            return "오류 발생", "오류 발생", None, f"❌ 처리 중 오류: {str(e)}"
+
+
     
     def check_environment():
         """Check if required environment variables are set"""
@@ -336,7 +384,7 @@ def create_gradio_interface():
                 # Environment check
                 gr.Markdown("## ⚙️ 시스템 상태")
                 env_status = gr.Markdown(check_environment())
-                refresh_btn = gr.Button("🔄 상태 새로고침", size="sm")
+                refresh_btn = gr.Button("🔄 상태 새로고침")
         
         # Results section
         gr.Markdown("## 📊 분석 결과")
@@ -408,6 +456,6 @@ if __name__ == "__main__":
     demo.launch(
         server_name="0.0.0.0",  # Allow external access
         server_port=7860,       # Default Gradio port
-        share=True,             # Create public link
+        share=False,             # Create public link
         debug=True              # Enable debug mode
     )
