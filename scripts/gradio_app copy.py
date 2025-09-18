@@ -4,8 +4,6 @@ import json
 from pathlib import Path
 import tempfile
 import shutil
-from datetime import datetime
-import re
 
 # Import the core music generation functionality
 from music_generator_core import (
@@ -13,42 +11,6 @@ from music_generator_core import (
     dump, generate_with_replicate_strict,
     analyze_emotion_node, compose_brief_node  # Import new nodes
 )
-
-
-def _safe_filename(s: str, max_len: int = 80) -> str:
-    # 한글/영문/숫자/공백/일부 기호만 허용 → 나머지는 _
-    s = s.strip()
-    s = re.sub(r"[^0-9A-Za-z가-힣 _\-\(\)\[\]\.]", "_", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:max_len]
-
-def _title_from_brief(brief: MusicBrief) -> str:
-    # 예: "Joyful - C major - 130bpm - regulate:uplift"
-    mode = next((t for t in (brief.style_tags or []) if t.startswith("regulate:")), None)
-    parts = [brief.mood, brief.key, f"{brief.bpm}bpm"]
-    if mode: parts.append(mode)
-    return " - ".join([p for p in parts if p])
-
-def _rename_generated_file(src_path: str, brief: MusicBrief) -> tuple[str, str]:
-    """
-    생성된 파일을 '제목_YYYYMMDD_HHMMSS.ext'로 rename.
-    - 파일명: OS 호환 위해 안전한 문자만 사용 (':' 같은 건 '_'로)
-    - 라벨(표시용 제목): 콜론 그대로 유지 + 뒤에 '_YYYYMMDD_HHMMSS'
-    반환: (새 경로, 표시용 제목)
-    """
-    base_title = _title_from_brief(brief) or "Therapeutic Music"
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # 파일명용(안전 문자만)
-    safe_base = _safe_filename(base_title)   # ':' → '_'로 치환됨
-    root, ext = os.path.splitext(src_path)
-    dst_name = f"{safe_base}_{ts}{ext or '.wav'}"
-    dst = os.path.join(os.path.dirname(src_path), dst_name)
-    shutil.move(src_path, dst)
-
-    # 표시용 제목(콜론 유지) → "…regulate:uplift_20250918_174045"
-    display_title = f"{base_title}_{ts}"
-    return dst, display_title
 
 # === 상단에 유틸 추가 ===
 def _norm(s: str) -> str:
@@ -276,10 +238,6 @@ def create_gradio_interface():
                 # ▶ 이미 분석/브리프가 있음 → 그대로 재사용해서 합성만
                 brief = app_state.music_brief
                 audio_path = generate_with_replicate_strict(brief.prompt, int(brief.duration_sec))
-
-                audio_path, display_title = _rename_generated_file(audio_path, brief)
-                audio_ui = gr.update(value=audio_path, label=f"치료용 음악 — {display_title}")
-
                 status = "🎵 기존 분석/브리프 재사용하여 음악 생성"
             elif app_state.has_emotion_analysis(user_story) and not app_state.has_music_brief(user_story):
                 # ▶ 감정만 있음 → 브리프만 생성 후 합성
@@ -288,10 +246,6 @@ def create_gradio_interface():
                 app_state.music_brief = st["brief"]
                 brief = app_state.music_brief
                 audio_path = generate_with_replicate_strict(brief.prompt, int(brief.duration_sec))
-
-                audio_path, display_title = _rename_generated_file(audio_path, brief)
-                audio_ui = gr.update(value=audio_path, label=f"치료용 음악 — {display_title}")
-
                 status = "🧩 기존 감정 분석 재사용 → 브리프 생성 → 음악 생성"
             else:
                 # ▶ 원샷 생성(분석 없이 바로) → LangGraph 전체 파이프라인 실행
@@ -301,10 +255,6 @@ def create_gradio_interface():
                 app_state.emotion_result = emo
                 app_state.music_brief = brief
                 audio_path = final.get("audio_path")
-
-                audio_path, display_title = _rename_generated_file(audio_path, brief)
-                audio_ui = gr.update(value=audio_path, label=f"치료용 음악 — {display_title}")
-
                 status = f"🚀 원샷 생성 (graph.invoke 사용; provider={final.get('provider_used','?')})"
 
             # 출력 메시지 구성 (캐시 기준)
@@ -314,7 +264,7 @@ def create_gradio_interface():
             emotion_text = md_emotion(emo)
             brief_text   = md_brief(brief)
 
-            return emotion_text, brief_text, audio_ui, status
+            return emotion_text, brief_text, audio_path, status
 
         except Exception as e:
             return "오류 발생", "오류 발생", None, f"❌ 처리 중 오류: {str(e)}"
@@ -457,20 +407,6 @@ def create_gradio_interface():
                 )
         
         status_output = gr.Markdown("")
-
-        def _on_user_audio_change(path):
-            if not path:
-                return gr.update()
-            name = os.path.basename(path)
-            return gr.update(label=f"내 파일 업로드 — {name}")
-        
-        user_audio.change(
-            fn=_on_user_audio_change,
-            inputs=[user_audio],
-            outputs=[user_audio]
-        )
-
-
         
         emotion_only_btn.click(
             fn=analyze_emotion_only,

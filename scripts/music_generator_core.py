@@ -18,6 +18,12 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, START, END
 from urllib.parse import urlparse
 
+# 상단에 상수 추가(파일 맨 위쪽 근처)
+MIN_DUR = 120
+MAX_DUR = 180
+FALLBACK_DUR = 90   # 자동 폴백을 원치 않으면 이 줄과 아래 재시도 블록을 삭제하세요.
+
+
 # replicate는 "선택 임포트"
 try:
     import replicate  # 있으면 사용
@@ -97,7 +103,7 @@ def compose_brief_node(state: GraphState) -> GraphState:
         "  sustain(편안한 긍정 유지), ground(과도한 긍정/흥분을 안정적으로 접지).\n"
         "- 선택한 전략은 style_tags에 'regulate:<mode>' 형태로 반드시 포함한다.\n\n"
         "## 파라미터 규칙\n"
-        "1) bpm: 50~140 중 선택하되, duration_sec은 60~90으로 제한한다.\n"
+        "1) bpm: 50~140 중 선택하되, duration_sec은 120~180으로 제한한다.\n"
         "   - arousal↑ → bpm↑ 경향. 단, soothe/ground 전략일 때는 중간 템포(70~100)로 과자극 방지.\n"
         "   - uplift 전략(저각성·우울)일 땐 72~90 범위에서 부드럽게 추진.\n"
         "2) duration_sec: 120~180. 불안(arousal>0.6) 또는 우울(valence<-0.2)은 150~180을 우선 고려.\n"
@@ -217,9 +223,19 @@ def _save_first_output_to_file(out) -> str:
 def generate_with_replicate_strict(prompt: str, duration: int) -> str:
     tok = os.getenv("REPLICATE_API_TOKEN")
     assert tok, "REPLICATE_API_TOKEN이 없습니다 (.env 확인)"
-    assert 120 <= int(duration) <= 180, f"duration(초)은 120~180 범위여야 합니다: {duration}"
-    out = _replicate_run({"prompt": prompt, "duration": int(duration)}, tok)
-    return _save_first_output_to_file(out)
+    assert MIN_DUR <= int(duration) <= MAX_DUR, f"duration(초)은 {MIN_DUR}~{MAX_DUR} 범위여야 합니다: {duration}"
+    try:
+        out = _replicate_run({"prompt": prompt, "duration": int(duration)}, tok)
+        return _save_first_output_to_file(out)
+    except Exception as e:
+        msg = str(e)
+        # 길이 관련 거절(예: 'duration must be between ...')에만 자동 폴백 시도
+        if "duration" in msg.lower() or "length" in msg.lower():
+            # 자동 폴백 원치 않으면 아래 3줄을 지우고 에러 그대로 내보내세요.
+            out = _replicate_run({"prompt": prompt, "duration": FALLBACK_DUR}, tok)
+            return _save_first_output_to_file(out)
+        raise
+
 
 # %%
 # === 6) 생성 노드 ===
