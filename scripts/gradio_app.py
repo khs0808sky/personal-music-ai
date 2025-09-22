@@ -14,6 +14,12 @@ from music_generator_core import (
     analyze_emotion_node, compose_brief_node  # Import new nodes
 )
 
+from music_generate_image import (
+    graph as image_graph, 
+    GraphState as ImageGraphState,
+    analyze_emotion_from_image_node,
+    compose_brief_node as image_compose_brief_node
+)
 
 def _safe_filename(s: str, max_len: int = 80) -> str:
     # 한글/영문/숫자/공백/일부 기호만 허용 → 나머지는 _
@@ -21,6 +27,10 @@ def _safe_filename(s: str, max_len: int = 80) -> str:
     s = re.sub(r"[^0-9A-Za-z가-힣 _\-\(\)\[\]\.]", "_", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s[:max_len]
+
+def _label_with_ext(prefix: str, path: str) -> str:
+    return f"{prefix} — {os.path.basename(path)}"
+
 
 def _title_from_brief(brief: MusicBrief) -> str:
     # 예: "Joyful - C major - 130bpm - regulate:uplift"
@@ -65,9 +75,42 @@ def get_usage_md():
 def get_tips_md():
     return """### 💡 팁
 - 설계안이 마음에 들면 **음악 생성**을 누르면 그 설계안으로 음악이 만들어져요.
-- **같은 스토리**면 이전 감정분석을 재사용해요.
-- 스토리를 바꾸면 이전 결과는 초기화돼요.
+- **같은 스토리/이미지**면 이전 감정분석을 재사용해요.
+- 스토리나 이미지를 바꾸면 이전 결과는 초기화돼요.
 """
+
+
+def on_text_tab_select():
+    # 지금부터 텍스트 모드
+    app_state.current_mode = "text"
+    # 반대편 입력(이미지)만 비우고, 결과 초기화
+    app_state.image_path = None
+    app_state.emotion_result = None
+    app_state.music_brief = None
+    return (
+        gr.update(),             # story_input: 유지 (바꾸지 않음)
+        gr.update(value=None),   # image_input: 비우기
+        "",                      # emotion_output
+        "",                      # brief_output
+        None,                    # audio_output
+        "📝 텍스트 탭으로 전환: 이전 이미지 입력과 결과를 초기화했습니다."
+    )
+
+def on_image_tab_select():
+    # 지금부터 이미지 모드
+    app_state.current_mode = "image"
+    # 반대편 입력(텍스트)만 비우고, 결과 초기화
+    app_state.user_story = None
+    app_state.emotion_result = None
+    app_state.music_brief = None
+    return (
+        gr.update(value=""),     # story_input: 비우기
+        gr.update(),             # image_input: 유지 (바꾸지 않음)
+        "",                      # emotion_output
+        "",                      # brief_output
+        None,                    # audio_output
+        "🖼️ 이미지 탭으로 전환: 이전 텍스트 입력과 결과를 초기화했습니다."
+    )
 
 
 
@@ -76,20 +119,39 @@ class AppState:
         self.emotion_result = None
         self.music_brief = None
         self.user_story = None
+        self.image_path = None
+        self.current_mode = "text"  # "text" or "image"
 
     def clear(self):
         self.emotion_result = None
         self.music_brief = None
         self.user_story = None
+        self.image_path = None
+        self.current_mode = "text"
 
     def set_story(self, s: str):
         self.user_story = _norm(s)
+        self.current_mode = "text"
 
-    def has_emotion_analysis(self, current_story):
-        return (self.emotion_result is not None and self.user_story == _norm(current_story))
+    def set_image(self, img_path: str):
+        self.image_path = img_path
+        self.current_mode = "image"
 
-    def has_music_brief(self, current_story):
-        return (self.music_brief is not None and self.user_story == _norm(current_story))
+    def has_emotion_analysis(self, current_story=None, current_image=None):
+        if self.current_mode == "text":
+            return (self.emotion_result is not None and 
+                   self.user_story == _norm(current_story or ""))
+        else:  # image mode
+            return (self.emotion_result is not None and 
+                   self.image_path == current_image)
+
+    def has_music_brief(self, current_story=None, current_image=None):
+        if self.current_mode == "text":
+            return (self.music_brief is not None and 
+                   self.user_story == _norm(current_story or ""))
+        else:  # image mode
+            return (self.music_brief is not None and 
+                   self.image_path == current_image)
 
 # 반복되는 코드 함수로 정의
 def _join(items):
@@ -133,47 +195,51 @@ app_state = AppState()
 def create_gradio_interface():
     """Create and configure the Gradio interface"""
     
-    def analyze_emotion_only(user_story):
+    def analyze_emotion_only(user_story, image_input):
         """
         Only analyze emotion without generating music
-        
-        Args:
-            user_story (str): User's emotional story/text
-        
-        Returns:
-            tuple: (emotion_analysis, status_message)
         """
         try:
-            if not _norm(user_story):
-                return "스토리를 입력해 주세요.", "", None, "⚠️ 입력이 비어 있습니다."
+            if image_input is not None:
+                # Image mode
+                if app_state.image_path != image_input:
+                    app_state.clear()
+                    app_state.set_image(image_input)
+                
+                if app_state.has_emotion_analysis(current_image=image_input):
+                    emo = app_state.emotion_result
+                    emotion_text = md_emotion(emo)
+                    return emotion_text, "", None, "♻️ 이전 감정 분석 결과 재사용 (이미지)"
+                
+                # Run image emotion analysis
+                state = {"image_path": image_input}
+                state = analyze_emotion_from_image_node(state)
+                app_state.emotion_result = state.get("emotion")
+                
+                emotion_text = md_emotion(app_state.emotion_result)
+                status = "✅ 이미지 감정 분석 완료!"
+                
+            else:
+                # Text mode
+                if not _norm(user_story):
+                    return "입력이 비어 있습니다. 텍스트를 입력하거나 이미지를 업로드해 주세요.", "", None, "⚠️ 입력이 비어 있습니다."
 
-            if app_state.user_story != _norm(user_story):
-                app_state.clear()
-                app_state.set_story(user_story)
+                if app_state.user_story != _norm(user_story):
+                    app_state.clear()
+                    app_state.set_story(user_story)
 
-            # ⬇️ 추가: 같은 스토리로 이미 분석한 결과가 있으면 재사용
-            if app_state.has_emotion_analysis(user_story):
-                emo = app_state.emotion_result
-                emotion_text = md_emotion(emo)  # 이미 만들어둔 헬퍼 사용 권장
-                return emotion_text, "", None, "♻️ 이전 감정 분석 결과 재사용"
-
-            
-            # Prepare the state for emotion analysis only
-            state = {
-                "user_text": user_story,
-                "force_generate": False  # Never generate music
-            }
-            
-            # Run only the emotion analysis node directly
-            state = analyze_emotion_node(state)
-            
-            # Extract emotion result
-            emotion = state.get("emotion")
-            app_state.emotion_result = emotion
-            
-            emotion_text = md_emotion(emotion)
-            
-            status = "✅ 감정 분석 완료! (크레딧 사용 안함)"
+                if app_state.has_emotion_analysis(current_story=user_story):
+                    emo = app_state.emotion_result
+                    emotion_text = md_emotion(emo)
+                    return emotion_text, "", None, "♻️ 이전 감정 분석 결과 재사용 (텍스트)"
+                
+                # Run text emotion analysis
+                state = {"user_text": user_story, "force_generate": False}
+                state = analyze_emotion_node(state)
+                app_state.emotion_result = state.get("emotion")
+                
+                emotion_text = md_emotion(app_state.emotion_result)
+                status = "✅ 텍스트 감정 분석 완료!"
             
             return emotion_text, "", None, status
             
@@ -181,49 +247,54 @@ def create_gradio_interface():
             error_msg = f"❌ 감정 분석 중 오류 발생: {str(e)}"
             return "오류 발생", "", None, error_msg
     
-    def generate_music_brief_only(user_story):
+    def generate_music_brief_only(user_story, image_input):
         """
         Analyze emotion and generate music brief without actual music generation
-        
-        Args:
-            user_story (str): User's emotional story/text
-        
-        Returns:
-            tuple: (emotion_analysis, music_brief, status_message)
         """
         try:
-            if not _norm(user_story):
-                return "스토리를 입력해 주세요.", "", None, "⚠️ 입력이 비어 있습니다."
-            
-            if app_state.user_story != _norm(user_story):
-                app_state.clear()
-                app_state.set_story(user_story)
-
-            
-            # Prepare the state
-            state = {
-                "user_text": user_story,
-                "force_generate": False  # Explicitly prevent music generation
-            }
-            
-            if app_state.has_emotion_analysis(user_story):
-                state["emotion"] = app_state.emotion_result
+            if image_input is not None:
+                # Image mode
+                if app_state.image_path != image_input:
+                    app_state.clear()
+                    app_state.set_image(image_input)
+                
+                state = {"image_path": image_input}
+                
+                if app_state.has_emotion_analysis(current_image=image_input):
+                    state["emotion"] = app_state.emotion_result
+                else:
+                    state = analyze_emotion_from_image_node(state)
+                    app_state.emotion_result = state.get("emotion")
+                
+                state = image_compose_brief_node(state)
+                app_state.music_brief = state.get("brief")
+                
+                status = "✅ 이미지 감정 분석 및 음악 브리프 생성 완료!"
+                
             else:
-                state = analyze_emotion_node(state)
-                app_state.emotion_result = state.get("emotion")
+                # Text mode
+                if not _norm(user_story):
+                    return "입력이 비어 있습니다. 텍스트를 입력하거나 이미지를 업로드해 주세요.", "", None, "⚠️ 입력이 비어 있습니다."
+                
+                if app_state.user_story != _norm(user_story):
+                    app_state.clear()
+                    app_state.set_story(user_story)
+
+                state = {"user_text": user_story, "force_generate": False}
+                
+                if app_state.has_emotion_analysis(current_story=user_story):
+                    state["emotion"] = app_state.emotion_result
+                else:
+                    state = analyze_emotion_node(state)
+                    app_state.emotion_result = state.get("emotion")
+                
+                state = compose_brief_node(state)
+                app_state.music_brief = state.get("brief")
+                
+                status = "✅ 텍스트 감정 분석 및 음악 브리프 생성 완료!"
             
-            # Run only the brief composition node  
-            state = compose_brief_node(state)
-            
-            # Extract results without running the full graph
-            emotion = state.get("emotion")
-            brief = state.get("brief")
-            app_state.music_brief = brief
-            
-            emotion_text = md_emotion(emotion)
-            brief_text   = md_brief(brief)
-            
-            status = "✅ 감정 분석 및 음악 브리프 생성 완료! (크레딧 사용 안함)"
+            emotion_text = md_emotion(app_state.emotion_result)
+            brief_text = md_brief(app_state.music_brief)
             
             return emotion_text, brief_text, None, status
             
@@ -231,93 +302,125 @@ def create_gradio_interface():
             error_msg = f"❌ 처리 중 오류 발생: {str(e)}"
             return "오류 발생", "오류 발생", None, error_msg
     
-    def generate_full_music(user_story):
+    def generate_full_music(user_story, image_input):
         """
-        두 모드 지원:
-        1) 원샷(분석 X) → graph.invoke 사용
-        2) 분석/브리프 끝난 후 음악만 → 캐시 재사용, 노드 직접 호출(필요시 브리프만 생성), 마지막에만 합성
+        Generate full music from text or image input
         """
         try:
-            if not _norm(user_story):
-                return "스토리를 입력해 주세요.", "", None, "⚠️ 입력이 비어 있습니다."
+            # 탭 업데이트 기본값(변경 없음)
+            tabs_update = gr.update()
 
-            # 스토리 바뀌면 캐시 초기화
-            if app_state.user_story != _norm(user_story):
-                app_state.clear()
-                app_state.set_story(user_story)
+            # ★ guard: 텍스트/이미지 둘 다 없는 경우
+            if (image_input is None) and (not _norm(user_story)):
+                return ("입력이 비어 있습니다. 텍스트를 입력하거나 이미지를 업로드해 주세요.",
+                        "", None, "⚠️ 입력이 비어 있습니다.", tabs_update)
 
+            if image_input is not None:
+                # Image mode
+                if app_state.image_path != image_input:
+                    app_state.clear()
+                    app_state.set_image(image_input)
+            else:
+                # Text mode
+                if not _norm(user_story):
+                    return ("입력이 비어 있습니다. 텍스트를 입력하거나 이미지를 업로드해 주세요.", "", None, "⚠️ 입력이 비어 있습니다.", tabs_update)
+                if app_state.user_story != _norm(user_story):
+                    app_state.clear()
+                    app_state.set_story(user_story)
 
             # 환경 체크
             openai_ok = bool(os.getenv("OPENAI_API_KEY"))
             repl_ok   = bool(os.getenv("REPLICATE_API_TOKEN"))
             use_repl  = os.getenv("USE_REPLICATE", "0") == "1"
             if not openai_ok:
-                return "OpenAI 키가 없습니다.", "", None, "❌ OPENAI_API_KEY 필요"
+                return "OpenAI 키가 없습니다.", "", None, "❌ OPENAI_API_KEY 필요", tabs_update
             if not (repl_ok and use_repl):
-                # 음악 합성은 건너뛰고, 분석/브리프만 보여주기
-                # 필요 시 여기서 분석/브리프 생성할 수도 있음
-                if not app_state.has_emotion_analysis(user_story):
-                    st = {"user_text": user_story}
-                    st = analyze_emotion_node(st)
-                    app_state.emotion_result = st["emotion"]
-                if not app_state.has_music_brief(user_story):
-                    st = {"user_text": user_story, "emotion": app_state.emotion_result}
-                    st = compose_brief_node(st)
-                    app_state.music_brief = st["brief"]
-                emo, brief = app_state.emotion_result, app_state.music_brief
+                # 음악 합성 건너뛰고 분석/브리프만
+                if app_state.current_mode == "image":
+                    if not app_state.has_emotion_analysis(current_image=image_input):
+                        st = {"image_path": image_input}
+                        st = analyze_emotion_from_image_node(st)
+                        app_state.emotion_result = st["emotion"]
+                    if not app_state.has_music_brief(current_image=image_input):
+                        st = {"image_path": image_input, "emotion": app_state.emotion_result}
+                        st = image_compose_brief_node(st)
+                        app_state.music_brief = st["brief"]
+                else:
+                    if not app_state.has_emotion_analysis(current_story=user_story):
+                        st = {"user_text": user_story}
+                        st = analyze_emotion_node(st)
+                        app_state.emotion_result = st["emotion"]
+                    if not app_state.has_music_brief(current_story=user_story):
+                        st = {"user_text": user_story, "emotion": app_state.emotion_result}
+                        st = compose_brief_node(st)
+                        app_state.music_brief = st["brief"]
 
+                emo, brief = app_state.emotion_result, app_state.music_brief
                 emotion_text = md_emotion(emo)
                 brief_text   = md_brief(brief)
-
-                return emotion_text, brief_text, None, "⚠️ USE_REPLICATE=1 또는 REPLICATE 토큰 없음 → 음악 생성 건너뜀"
+                return emotion_text, brief_text, None, "⚠️ USE_REPLICATE=1 또는 REPLICATE 토큰 없음 → 음악 생성 건너뜀", tabs_update
 
             # ── 분기 ───────────────────────────────────────────────────────────
-            if app_state.has_emotion_analysis(user_story) and app_state.has_music_brief(user_story):
-                # ▶ 이미 분석/브리프가 있음 → 그대로 재사용해서 합성만
+            if (app_state.has_emotion_analysis(current_story=user_story, current_image=image_input) and 
+                app_state.has_music_brief(current_story=user_story, current_image=image_input)):
+                # ▶ 분석/브리프 재사용 → 합성만
                 brief = app_state.music_brief
                 audio_path = generate_with_replicate_strict(brief.prompt, int(brief.duration_sec))
+                audio_path, _ = _rename_generated_file(audio_path, brief)
+                audio_ui = gr.update(value=audio_path, label=_label_with_ext("치료용 음악", audio_path))
+                status = f"🎵 기존 분석/브리프 재사용하여 음악 생성 ({app_state.current_mode})"
+                tabs_update = gr.update(selected=0)
 
-                audio_path, display_title = _rename_generated_file(audio_path, brief)
-                audio_ui = gr.update(value=audio_path, label=f"치료용 음악 — {display_title}")
-
-                status = "🎵 기존 분석/브리프 재사용하여 음악 생성"
-            elif app_state.has_emotion_analysis(user_story) and not app_state.has_music_brief(user_story):
-                # ▶ 감정만 있음 → 브리프만 생성 후 합성
-                st = {"user_text": user_story, "emotion": app_state.emotion_result}
-                st = compose_brief_node(st)
+            elif (app_state.has_emotion_analysis(current_story=user_story, current_image=image_input) and 
+                not app_state.has_music_brief(current_story=user_story, current_image=image_input)):
+                # ▶ 감정만 있음 → 브리프 생성 → 합성
+                if app_state.current_mode == "image":
+                    st = {"image_path": image_input, "emotion": app_state.emotion_result}
+                    st = image_compose_brief_node(st)
+                else:
+                    st = {"user_text": user_story, "emotion": app_state.emotion_result}
+                    st = compose_brief_node(st)
                 app_state.music_brief = st["brief"]
                 brief = app_state.music_brief
                 audio_path = generate_with_replicate_strict(brief.prompt, int(brief.duration_sec))
+                audio_path, _ = _rename_generated_file(audio_path, brief)
+                audio_ui = gr.update(value=audio_path, label=_label_with_ext("치료용 음악", audio_path))
+                status = f"🧩 기존 감정 분석 재사용 → 브리프 생성 → 음악 생성 ({app_state.current_mode})"
+                tabs_update = gr.update(selected=0)
 
-                audio_path, display_title = _rename_generated_file(audio_path, brief)
-                audio_ui = gr.update(value=audio_path, label=f"치료용 음악 — {display_title}")
-
-                status = "🧩 기존 감정 분석 재사용 → 브리프 생성 → 음악 생성"
             else:
-                # ▶ 원샷 생성(분석 없이 바로) → LangGraph 전체 파이프라인 실행
-                state = {"user_text": user_story, "force_generate": True}
-                final = graph.invoke(state)  # analyze → brief → generate
-                emo = final["emotion"]; brief = final["brief"]
-                app_state.emotion_result = emo
-                app_state.music_brief = brief
-                audio_path = final.get("audio_path")
+                # ▶ 원샷
+                if app_state.current_mode == "image":
+                    st = {"image_path": image_input}
+                    final = image_graph.invoke(st)
+                    emo = final["emotion"]; brief = final["brief"]
+                    app_state.emotion_result = emo
+                    app_state.music_brief = brief
+                    audio_path = generate_with_replicate_strict(brief.prompt, int(brief.duration_sec))
+                    audio_path, _ = _rename_generated_file(audio_path, brief)
+                    audio_ui = gr.update(value=audio_path, label=_label_with_ext("치료용 음악", audio_path))
+                else:
+                    st = {"user_text": user_story, "force_generate": True}
+                    final = graph.invoke(st)
+                    emo = final["emotion"]; brief = final["brief"]
+                    app_state.emotion_result = emo
+                    app_state.music_brief = brief
+                    audio_path = final.get("audio_path")
+                    audio_path, _ = _rename_generated_file(audio_path, brief)
+                    audio_ui = gr.update(value=audio_path, label=_label_with_ext("치료용 음악", audio_path))
+                status = f"🚀 원샷 생성 ({app_state.current_mode} 모드)"
+                tabs_update = gr.update(selected=0)
 
-                audio_path, display_title = _rename_generated_file(audio_path, brief)
-                audio_ui = gr.update(value=audio_path, label=f"치료용 음악 — {display_title}")
-
-                status = f"🚀 원샷 생성 (graph.invoke 사용; provider={final.get('provider_used','?')})"
-
-            # 출력 메시지 구성 (캐시 기준)
+            # 출력 구성
             emo = app_state.emotion_result
             brief = app_state.music_brief
-            
             emotion_text = md_emotion(emo)
             brief_text   = md_brief(brief)
-
-            return emotion_text, brief_text, audio_ui, status
+            return emotion_text, brief_text, audio_ui, status, tabs_update
 
         except Exception as e:
-            return "오류 발생", "오류 발생", None, f"❌ 처리 중 오류: {str(e)}"
+            return "오류 발생", "오류 발생", None, f"❌ 처리 중 오류: {str(e)}", gr.update()
+
     
     # Create the Gradio interface
     with gr.Blocks(
@@ -328,6 +431,7 @@ def create_gradio_interface():
         .story-input { min-height: 150px; }
         .result-box { border: 1px solid #e0e0e0; border-radius: 8px; padding: 15px; margin: 10px 0; }
         .step-button { margin: 5px; }
+
         /* 사용법/팁 카드 */
         .info-card {
         border: 1px solid #e5e7eb;
@@ -336,11 +440,7 @@ def create_gradio_interface():
         padding: 14px 16px;
         transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
         }
-        .info-card:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 6px 16px rgba(0,0,0,0.06);
-        border-color: #d1d5db;
-        }
+
         /* 제목/본문 가독성 강화 */
         .info-card h3 {
         margin: 0 0 8px 0;
@@ -352,10 +452,84 @@ def create_gradio_interface():
         color: #111827;
         line-height: 1.55;
         }
-        /* (원하면) 가운데 정렬: 주석 해제
-        .info-card { text-align: center; }
-        .info-card ul { display: inline-block; text-align: left; }
-        */
+
+        /* ───────── Gradio 버튼 색상(변수) 오버라이드: elem_id 범위 내에서만 적용 ───────── */
+
+        /* 감정 분석(초록 틴트) — secondary 변형 */
+        #btn-emotion {
+        --button-secondary-background-fill: #F0FDF4;          /* 기본 배경 */
+        --button-secondary-text-color:       #065F46;          /* 텍스트 */
+        --button-secondary-border-color:     #4ADE80;          /* 테두리 */
+        --button-secondary-background-fill-hover: #DCFCE7;     /* 호버 배경 */
+        --button-secondary-border-color-hover:     #22C55E;    /* 호버 테두리 */
+        --button-shadow: 0 1px 0 rgba(0,0,0,.03);
+        }
+
+        /* 감정 분석 + 음악 설계(오렌지 틴트) — secondary 변형 */
+        #btn-brief {
+        --button-secondary-background-fill: #FFF7ED;
+        --button-secondary-text-color:       #9A3412;
+        --button-secondary-border-color:     #FB923C;
+        --button-secondary-background-fill-hover: #FFEDD5;
+        --button-secondary-border-color-hover:     #F97316;
+        --button-shadow: 0 1px 0 rgba(0,0,0,.03);
+        }
+
+        /* 메인 CTA: 음악 생성(파랑) — primary 변형 */
+        #btn-generate {
+        --button-primary-background-fill: #2563EB;
+        --button-primary-text-color:      #FFFFFF;
+        --button-primary-border-color:    #1D4ED8;
+        --button-primary-background-fill-hover: #1D4ED8;
+        --button-shadow: 0 8px 18px rgba(37,99,235,0.28);
+        }
+
+        /* 크기/윤곽/전환 효과(버튼처럼 보이게) — 구조 변화에도 잘 먹히도록 넓은 선택자 */
+        #btn-emotion button, #btn-emotion .gr-button, #btn-emotion [role="button"],
+        #btn-brief   button, #btn-brief   .gr-button, #btn-brief   [role="button"],
+        #btn-generate button, #btn-generate .gr-button, #btn-generate [role="button"] {
+        height: 44px;
+        min-width: 200px;
+        padding: 0 16px;
+        border-radius: 10px;
+        font-weight: 700;
+        letter-spacing: .01em;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        transition: background .12s ease, border-color .12s ease,
+                    box-shadow .12s ease, transform .06s ease;
+        }
+
+        /* 포커스 접근성 링 */
+        #btn-emotion button:focus-visible,
+        #btn-brief button:focus-visible,
+        #btn-generate button:focus-visible {
+        outline: 3px solid rgba(59,130,246,.45);
+        outline-offset: 2px;
+        }
+
+        /* 호버 시 살짝 상승 효과(CTA만 더 강조) */
+        #btn-generate button:hover,
+        #btn-generate .gr-button:hover,
+        #btn-generate [role="button"]:hover {
+        transform: translateY(-1px);
+        }
+        #btn-generate button:active,
+        #btn-generate .gr-button:active,
+        #btn-generate [role="button"]:active {
+        transform: translateY(0);
+        }
+
+        /* 모바일: 꽉 차게 */
+        @media (max-width: 768px) {
+        #btn-emotion button, #btn-emotion .gr-button, #btn-emotion [role="button"],
+        #btn-brief   button, #btn-brief   .gr-button, #btn-brief   [role="button"],
+        #btn-generate button, #btn-generate .gr-button, #btn-generate [role="button"] {
+            width: 100%;
+            min-width: 0;
+        }
+        }
 
         """
     ) as demo:
@@ -371,44 +545,60 @@ def create_gradio_interface():
         
         with gr.Row():
             with gr.Column(scale=2):
-                # Input section
-                gr.Markdown("## 📝 당신의 이야기를 들려주세요")
-                
-                story_input = gr.Textbox(
-                    label="감정이나 상황을 자유롭게 써주세요",
-                    placeholder="예: 오늘 하루 종일 마음이 무거웠다. 일정을 정리하다가 페이지를 넘기는 손이 자주 멈췄다. 시간이 흐르는 게 잘 느껴지지 않았다...",
-                    lines=6,
-                    elem_classes=["story-input"]
-                )
-                
+                # 👇 탭을 전체 너비로 올려서 밑줄이 좌우 끝까지 보이게
+                gr.Markdown("## 🔽 입력 방식을 선택하세요")
+
+                with gr.Tabs() as input_tabs:
+                    with gr.Tab("📝 텍스트") as text_tab:   # ← 변수로 받기
+                        with gr.Row():
+                            with gr.Column(scale=2):
+                                story_input = gr.Textbox(
+                                    label="감정이나 상황을 자유롭게 써주세요",
+                                    placeholder="예: 오늘 하루 종일 마음이 무거웠다...",
+                                    lines=6,
+                                    elem_classes=["story-input"]
+                                )
+                            with gr.Column(scale=1):
+                                gr.Markdown(get_usage_md(), elem_classes=["info-card"])
+                                gr.Markdown(get_tips_md(),  elem_classes=["info-card"])
+
+                    with gr.Tab("🖼️ 이미지") as image_tab: # ← 변수로 받기
+                        with gr.Row():
+                            with gr.Column(scale=2):
+                                image_input = gr.Image(
+                                    label="감정을 표현하는 이미지를 업로드하세요",
+                                    type="filepath",
+                                    sources=["upload", "clipboard"],
+                                    height=300
+                                )
+                            with gr.Column(scale=1):
+                                gr.Markdown(get_usage_md(), elem_classes=["info-card"])
+                                gr.Markdown(get_tips_md(),  elem_classes=["info-card"])
+
+                # 👇 버튼들은 탭(밑줄) 아래에 그대로 놓임 (전체 너비)
                 gr.Markdown("## 🎯 원하는 작업을 선택하세요")
-                
                 with gr.Row():
                     emotion_only_btn = gr.Button(
-                        "🔍 감정 분석", 
-                        variant="secondary", 
+                        "🔍 감정 분석",
+                        variant="secondary",           # ← 하얀/아웃라인
                         scale=1,
-                        elem_classes=["step-button"]
+                        elem_classes=["step-button"],
+                        elem_id="btn-emotion"          # ← CSS 타겟팅용
                     )
-                    brief_only_btn = gr.Button(
-                        "📋 감정 분석 + 음악 설계", 
-                        variant="primary", 
+                    brief_only_btn   = gr.Button(
+                        "📋 감정 분석 + 음악 설계",
+                        variant="secondary",           # ← 하얀/아웃라인 (변경 포인트)
                         scale=1,
-                        elem_classes=["step-button"]
+                        elem_classes=["step-button"],
+                        elem_id="btn-brief"            # ← CSS 타겟팅용
                     )
-                    full_generate_btn = gr.Button(
-                        "🎵 음악 생성", 
-                        variant="primary", 
+                    full_generate_btn= gr.Button(
+                        "🎵 음악 생성",
+                        variant="primary",             # ← 파란색 유지
                         scale=1,
-                        elem_classes=["step-button"]
+                        elem_classes=["step-button"],
+                        elem_id="btn-generate"         # ← CSS 타겟팅용
                     )
-            # 오른쪽 정보 패널 부분
-            with gr.Column(scale=1):
-                with gr.Row():
-                    with gr.Column():
-                        gr.Markdown(get_usage_md(), elem_classes=["info-card"])  # ← 변경
-                    with gr.Column():
-                        gr.Markdown(get_tips_md(), elem_classes=["info-card"])   # ← 변경
 
         
         # Results section
@@ -430,7 +620,7 @@ def create_gradio_interface():
         # Audio output and download
         gr.Markdown("## 🎵 생성/재생")
 
-        with gr.Tabs():
+        with gr.Tabs() as audio_tabs:
             with gr.Tab("🎵 생성된 음악"):
                 audio_output = gr.Audio(
                     label="치료용 음악",
@@ -470,25 +660,38 @@ def create_gradio_interface():
             outputs=[user_audio]
         )
 
-
         
         emotion_only_btn.click(
             fn=analyze_emotion_only,
-            inputs=[story_input],
+            inputs=[story_input, image_input],
             outputs=[emotion_output, brief_output, audio_output, status_output]
         )
         
         brief_only_btn.click(
             fn=generate_music_brief_only,
-            inputs=[story_input],
+            inputs=[story_input, image_input],
             outputs=[emotion_output, brief_output, audio_output, status_output]
         )
         
         full_generate_btn.click(
             fn=generate_full_music,
-            inputs=[story_input],
-            outputs=[emotion_output, brief_output, audio_output, status_output]
+            inputs=[story_input, image_input],
+            outputs=[emotion_output, brief_output, audio_output, status_output, audio_tabs],
         )
+
+        text_tab.select(
+            fn=on_text_tab_select,
+            inputs=[],
+            outputs=[story_input, image_input, emotion_output, brief_output, audio_output, status_output]
+        )
+
+        image_tab.select(
+            fn=on_image_tab_select,
+            inputs=[],
+            outputs=[story_input, image_input, emotion_output, brief_output, audio_output, status_output]
+        )
+
+
         
         # Footer
         gr.Markdown("""

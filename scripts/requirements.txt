@@ -7,3 +7,6 @@ typing-extensions
 python-dotenv
 requests
 replicate
+torch
+transformers
+pillow
